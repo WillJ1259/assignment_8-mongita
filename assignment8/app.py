@@ -1,0 +1,236 @@
+from flask import Flask, render_template, request, redirect, url_for
+from mongita import MongitaClientDisk
+import os
+
+app = Flask(__name__)
+
+# ------------------------------------------
+# Mongita Setup (local embedded NoSQL DB)
+# ------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+client = MongitaClientDisk(os.path.join(BASE_DIR, "mongita_data"))
+
+db = client.bookstore
+categories_col = db.category
+books_col = db.book
+
+
+# ------------------------------------------
+# Helper Functions
+# ------------------------------------------
+def get_categories():
+    categories = list(categories_col.find())
+    return sorted(categories, key=lambda c: c["categoryName"])
+
+
+def get_next_book_id():
+    books = list(books_col.find())
+
+    if not books:
+        return 1
+
+    return max(book["bookId"] for book in books) + 1
+
+
+def get_category_name(category_id):
+    category = categories_col.find_one({"categoryId": category_id})
+    return category["categoryName"] if category else ""
+
+
+def get_book_form_data(book_id=None):
+    category_id = request.form.get("categoryId", type=int)
+
+    read_now = request.form.get("readNow", type=int)
+
+    book = {
+        "categoryId": category_id,
+        "categoryName": get_category_name(category_id),
+        "title": request.form.get("title", "").strip(),
+        "author": request.form.get("author", "").strip(),
+        "isbn": request.form.get("isbn", "").strip(),
+        "price": request.form.get("price", type=float),
+        "image": request.form.get("image", "").strip(),
+        "readNow": read_now if read_now is not None else 0
+    }
+
+    if book_id is not None:
+        book["bookId"] = book_id
+
+    return book
+
+
+# ------------------------------------------
+# HOME PAGE
+# ------------------------------------------
+@app.route("/", methods=["GET"])
+def home():
+    categories = get_categories()
+    return render_template("index.html", categories=categories)
+
+
+# ------------------------------------------
+# CATEGORY PAGE
+# /category?categoryId=1
+# ------------------------------------------
+@app.route("/category", methods=["GET"])
+def category():
+    category_id = request.args.get("categoryId", type=int)
+
+    categories = get_categories()
+    selected_category = categories_col.find_one({"categoryId": category_id})
+
+    books = list(books_col.find({"categoryId": category_id}))
+    books = sorted(books, key=lambda b: b["title"])
+
+    return render_template(
+        "category.html",
+        categories=categories,
+        selectedCategory=selected_category,
+        books=books,
+        searchTerm=None,
+        nothingFound=False
+    )
+
+
+# ------------------------------------------
+# SEARCH
+# ------------------------------------------
+@app.route("/search", methods=["POST"])
+def search():
+    term = request.form.get("search", "").strip()
+
+    categories = get_categories()
+    all_books = list(books_col.find())
+
+    books = [
+        book for book in all_books
+        if term.lower() in book["title"].lower()
+    ]
+    books = sorted(books, key=lambda b: b["title"])
+
+    return render_template(
+        "category.html",
+        categories=categories,
+        selectedCategory=None,
+        books=books,
+        searchTerm=term,
+        nothingFound=(len(books) == 0)
+    )
+
+
+# ------------------------------------------
+# BOOK DETAIL PAGE
+# /book?bookId=3
+# ------------------------------------------
+@app.route("/book", methods=["GET"])
+def book_detail():
+    book_id = request.args.get("bookId", type=int)
+
+    categories = get_categories()
+    book = books_col.find_one({"bookId": book_id})
+
+    if not book:
+        return render_template("error.html", error="Book not found"), 404
+
+    return render_template(
+        "book_detail.html",
+        book=book,
+        categories=categories
+    )
+
+
+# ------------------------------------------
+# READ ALL BOOKS
+# ------------------------------------------
+@app.route("/read", methods=["GET"])
+def read_books():
+    categories = get_categories()
+    books = list(books_col.find())
+    books = sorted(books, key=lambda b: b["title"])
+
+    return render_template("read.html", categories=categories, books=books)
+
+
+# ------------------------------------------
+# CREATE BOOK
+# ------------------------------------------
+@app.route("/create", methods=["GET"])
+def create():
+    categories = get_categories()
+    return render_template("create.html", categories=categories)
+
+
+@app.route("/create_post", methods=["POST"])
+def create_post():
+    new_book = get_book_form_data(book_id=get_next_book_id())
+    books_col.insert_one(new_book)
+
+    return redirect(url_for("read_books"))
+
+
+# ------------------------------------------
+# EDIT BOOK
+# ------------------------------------------
+@app.route("/edit/<int:book_id>", methods=["GET"])
+def edit(book_id):
+    categories = get_categories()
+    book = books_col.find_one({"bookId": book_id})
+
+    if not book:
+        return render_template("error.html", error="Book not found"), 404
+
+    return render_template("edit.html", categories=categories, book=book)
+
+
+@app.route("/edit_post/<int:book_id>", methods=["POST"])
+def edit_post(book_id):
+    updated_book = get_book_form_data()
+    result = books_col.update_one(
+        {"bookId": book_id},
+        {"$set": updated_book}
+    )
+
+    if result.matched_count == 0:
+        return render_template("error.html", error="Book not found"), 404
+
+    return redirect(url_for("read_books"))
+
+
+# ------------------------------------------
+# DELETE BOOK
+# ------------------------------------------
+@app.route("/delete/<int:book_id>", methods=["GET"])
+def delete(book_id):
+    books_col.delete_one({"bookId": book_id})
+    return redirect(url_for("read_books"))
+
+
+# ------------------------------------------
+# ADD BOOK
+# ------------------------------------------
+@app.route("/add-book", methods=["GET", "POST"])
+def add_book():
+    if request.method == "POST":
+        new_book = get_book_form_data(book_id=get_next_book_id())
+        books_col.insert_one(new_book)
+
+        return redirect(url_for("home"))
+
+    categories = get_categories()
+    return render_template("add_book.html", categories=categories)
+
+
+# ------------------------------------------
+# ERRORS
+# ------------------------------------------
+@app.errorhandler(Exception)
+def handle_error(e):
+    return render_template("error.html", error=e), 500
+
+
+# ------------------------------------------
+# RUN APP
+# ------------------------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=True)
